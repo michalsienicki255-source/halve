@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 
 export const runtime = "nodejs";
@@ -46,6 +47,60 @@ w schemacie podanym przez użytkownika. Reguły:
 - Pomijaj wiersze typu "RAZEM", "SUMA", "PTU", "NIP" - to nie są pozycje.
 - Jeśli nic nie widać / zdjęcie nie jest paragonem: zwróć items: [] i total: 0.`;
 
+const USER_PROMPT = `Wyodrębnij pozycje z tego paragonu jako JSON o strukturze:
+{
+  "store": string,
+  "date": string,
+  "currency": string,
+  "items": [{ "name": string, "quantity": number, "unitPrice": number }],
+  "subtotal": number,
+  "tax": number,
+  "total": number
+}`;
+
+async function scanWithGemini(image: string, apiKey: string): Promise<string> {
+  const match = image.match(/^data:(.+?);base64,(.+)$/);
+  if (!match) throw new Error("Niepoprawny data URL obrazu");
+  const [, mimeType, base64Data] = match;
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.0-flash",
+    systemInstruction: SYSTEM_PROMPT,
+    generationConfig: {
+      temperature: 0.1,
+      responseMimeType: "application/json",
+    },
+  });
+
+  const result = await model.generateContent([
+    USER_PROMPT,
+    { inlineData: { mimeType, data: base64Data } },
+  ]);
+
+  return result.response.text();
+}
+
+async function scanWithOpenAI(image: string, apiKey: string): Promise<string> {
+  const openai = new OpenAI({ apiKey });
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o",
+    temperature: 0.1,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: USER_PROMPT },
+          { type: "image_url", image_url: { url: image, detail: "high" } },
+        ],
+      },
+    ],
+  });
+  return completion.choices[0]?.message?.content ?? "";
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -57,50 +112,22 @@ export async function POST(req: Request) {
       );
     }
 
-    if (!process.env.OPENAI_API_KEY) {
+    const hasGemini = !!process.env.GEMINI_API_KEY;
+    const hasOpenAI = !!process.env.OPENAI_API_KEY;
+    if (!hasGemini && !hasOpenAI) {
       return NextResponse.json(
         {
           error:
-            "Brak OPENAI_API_KEY w .env.local. Dodaj klucz OpenAI i uruchom ponownie dev server.",
+            "Brak klucza AI. Ustaw GEMINI_API_KEY (darmowy) lub OPENAI_API_KEY w env Vercela.",
         },
         { status: 500 }
       );
     }
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const raw = hasGemini
+      ? await scanWithGemini(parsed.data.image, process.env.GEMINI_API_KEY!)
+      : await scanWithOpenAI(parsed.data.image, process.env.OPENAI_API_KEY!);
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o",
-      temperature: 0.1,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `Wyodrębnij pozycje z tego paragonu jako JSON o strukturze:
-{
-  "store": string,
-  "date": string,
-  "currency": string,
-  "items": [{ "name": string, "quantity": number, "unitPrice": number }],
-  "subtotal": number,
-  "tax": number,
-  "total": number
-}`,
-            },
-            {
-              type: "image_url",
-              image_url: { url: parsed.data.image, detail: "high" },
-            },
-          ],
-        },
-      ],
-    });
-
-    const raw = completion.choices[0]?.message?.content;
     if (!raw) {
       return NextResponse.json(
         { error: "Model nie zwrócił żadnej odpowiedzi" },

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { z } from "zod";
 
 export const runtime = "nodejs";
@@ -54,6 +55,59 @@ Rules:
 Schema:
 { "suggestions": [ { "itemId": string, "ownerIds": string[], "confidence": 0..1, "reason": string } ] }`;
 
+function buildUserPrompt(payload: z.infer<typeof RequestSchema>): string {
+  return `People:\n${payload.people
+    .map((p) => `- ${p.id}: ${p.name}`)
+    .join("\n")}\n\nItems:\n${payload.items
+    .map((it) => `- ${it.id}: ${it.name}`)
+    .join("\n")}${
+    payload.history
+      ? `\n\nHistory (what each person previously had):\n${Object.entries(
+          payload.history
+        )
+          .map(
+            ([pid, names]) =>
+              `- ${pid}: ${names.slice(0, 20).join(", ")}`
+          )
+          .join("\n")}`
+      : ""
+  }\n\nSuggest assignments as JSON.`;
+}
+
+async function suggestWithGemini(
+  userPrompt: string,
+  apiKey: string
+): Promise<string> {
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.0-flash",
+    systemInstruction: SYSTEM_PROMPT,
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+    },
+  });
+  const result = await model.generateContent(userPrompt);
+  return result.response.text();
+}
+
+async function suggestWithOpenAI(
+  userPrompt: string,
+  apiKey: string
+): Promise<string> {
+  const openai = new OpenAI({ apiKey });
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userPrompt },
+    ],
+  });
+  return completion.choices[0]?.message?.content ?? "";
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -64,44 +118,22 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
-    if (!process.env.OPENAI_API_KEY) {
+
+    const hasGemini = !!process.env.GEMINI_API_KEY;
+    const hasOpenAI = !!process.env.OPENAI_API_KEY;
+    if (!hasGemini && !hasOpenAI) {
       return NextResponse.json(
-        { error: "OPENAI_API_KEY missing" },
+        { error: "No AI provider key configured" },
         { status: 500 }
       );
     }
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const payload = parsed.data;
+    const userPrompt = buildUserPrompt(parsed.data);
 
-    const userPrompt = `People:\n${payload.people
-      .map((p) => `- ${p.id}: ${p.name}`)
-      .join("\n")}\n\nItems:\n${payload.items
-      .map((it) => `- ${it.id}: ${it.name}`)
-      .join("\n")}${
-      payload.history
-        ? `\n\nHistory (what each person previously had):\n${Object.entries(
-            payload.history
-          )
-            .map(
-              ([pid, names]) =>
-                `- ${pid}: ${names.slice(0, 20).join(", ")}`
-            )
-            .join("\n")}`
-        : ""
-    }\n\nSuggest assignments as JSON.`;
+    const raw = hasGemini
+      ? await suggestWithGemini(userPrompt, process.env.GEMINI_API_KEY!)
+      : await suggestWithOpenAI(userPrompt, process.env.OPENAI_API_KEY!);
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-    });
-
-    const raw = completion.choices[0]?.message?.content;
     if (!raw) {
       return NextResponse.json({ error: "Empty response" }, { status: 502 });
     }
@@ -123,8 +155,8 @@ export async function POST(req: Request) {
       );
     }
 
-    const validItemIds = new Set(payload.items.map((i) => i.id));
-    const validPersonIds = new Set(payload.people.map((p) => p.id));
+    const validItemIds = new Set(parsed.data.items.map((i) => i.id));
+    const validPersonIds = new Set(parsed.data.people.map((p) => p.id));
     const filtered = result.data.suggestions
       .filter((s) => validItemIds.has(s.itemId))
       .map((s) => ({
