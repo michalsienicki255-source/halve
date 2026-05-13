@@ -23,7 +23,6 @@ const RequestSchema = z.object({
       })
     )
     .min(1),
-  /** Optional history for personalization: per person, list of items they ate before. */
   history: z
     .record(z.string(), z.array(z.string()))
     .optional(),
@@ -55,6 +54,29 @@ Rules:
 Schema:
 { "suggestions": [ { "itemId": string, "ownerIds": string[], "confidence": 0..1, "reason": string } ] }`;
 
+const TRANSIENT_PATTERN = /5\d\d|429|overload|unavailable|exhaust|quota/i;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function withRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  attempts = 2
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[${label}] attempt ${i + 1}/${attempts}: ${msg}`);
+      if (!TRANSIENT_PATTERN.test(msg) || i === attempts - 1) throw err;
+      await sleep(1000 + i * 800);
+    }
+  }
+  throw lastErr;
+}
+
 function buildUserPrompt(payload: z.infer<typeof RequestSchema>): string {
   return `People:\n${payload.people
     .map((p) => `- ${p.id}: ${p.name}`)
@@ -76,11 +98,12 @@ function buildUserPrompt(payload: z.infer<typeof RequestSchema>): string {
 
 async function suggestWithGemini(
   userPrompt: string,
-  apiKey: string
+  apiKey: string,
+  modelName: string
 ): Promise<string> {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash-lite",
+    model: modelName,
     systemInstruction: SYSTEM_PROMPT,
     generationConfig: {
       temperature: 0.2,
@@ -108,6 +131,44 @@ async function suggestWithOpenAI(
   return completion.choices[0]?.message?.content ?? "";
 }
 
+async function runWithFallback(userPrompt: string): Promise<string> {
+  const errors: string[] = [];
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
+
+  if (geminiKey) {
+    for (const model of ["gemini-2.5-flash-lite", "gemini-2.5-flash"]) {
+      try {
+        const raw = await withRetry(model, () =>
+          suggestWithGemini(userPrompt, geminiKey, model)
+        );
+        if (raw) return raw;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`${model}: ${msg.slice(0, 120)}`);
+      }
+    }
+  }
+
+  if (openaiKey) {
+    try {
+      const raw = await withRetry("openai-gpt-4o-mini", () =>
+        suggestWithOpenAI(userPrompt, openaiKey)
+      );
+      if (raw) return raw;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`openai-gpt-4o-mini: ${msg.slice(0, 120)}`);
+    }
+  }
+
+  throw new Error(
+    errors.length
+      ? `All AI providers failed: ${errors.join(" | ")}`
+      : "No AI key configured"
+  );
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -119,9 +180,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const hasGemini = !!process.env.GEMINI_API_KEY;
-    const hasOpenAI = !!process.env.OPENAI_API_KEY;
-    if (!hasGemini && !hasOpenAI) {
+    if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) {
       return NextResponse.json(
         { error: "No AI provider key configured" },
         { status: 500 }
@@ -129,14 +188,7 @@ export async function POST(req: Request) {
     }
 
     const userPrompt = buildUserPrompt(parsed.data);
-
-    const raw = hasGemini
-      ? await suggestWithGemini(userPrompt, process.env.GEMINI_API_KEY!)
-      : await suggestWithOpenAI(userPrompt, process.env.OPENAI_API_KEY!);
-
-    if (!raw) {
-      return NextResponse.json({ error: "Empty response" }, { status: 502 });
-    }
+    const raw = await runWithFallback(userPrompt);
 
     let json: unknown;
     try {
@@ -168,6 +220,6 @@ export async function POST(req: Request) {
     return NextResponse.json({ suggestions: filtered });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: message }, { status: 503 });
   }
 }

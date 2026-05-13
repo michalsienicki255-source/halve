@@ -58,26 +58,55 @@ const USER_PROMPT = `Wyodrębnij pozycje z tego paragonu jako JSON o strukturze:
   "total": number
 }`;
 
-async function scanWithGemini(image: string, apiKey: string): Promise<string> {
+const TRANSIENT_PATTERN = /5\d\d|429|overload|unavailable|exhaust|quota/i;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function withRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  attempts = 2
+): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const transient = TRANSIENT_PATTERN.test(msg);
+      console.warn(`[${label}] attempt ${i + 1}/${attempts} failed: ${msg}`);
+      if (!transient || i === attempts - 1) throw err;
+      await sleep(1200 + i * 1000);
+    }
+  }
+  throw lastErr;
+}
+
+function parseDataUrl(image: string): { mimeType: string; data: string } {
   const match = image.match(/^data:(.+?);base64,(.+)$/);
   if (!match) throw new Error("Niepoprawny data URL obrazu");
-  const [, mimeType, base64Data] = match;
+  return { mimeType: match[1], data: match[2] };
+}
 
+async function scanWithGemini(
+  image: string,
+  apiKey: string,
+  modelName: string
+): Promise<string> {
+  const { mimeType, data } = parseDataUrl(image);
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
+    model: modelName,
     systemInstruction: SYSTEM_PROMPT,
     generationConfig: {
       temperature: 0.1,
       responseMimeType: "application/json",
     },
   });
-
   const result = await model.generateContent([
     USER_PROMPT,
-    { inlineData: { mimeType, data: base64Data } },
+    { inlineData: { mimeType, data } },
   ]);
-
   return result.response.text();
 }
 
@@ -101,6 +130,46 @@ async function scanWithOpenAI(image: string, apiKey: string): Promise<string> {
   return completion.choices[0]?.message?.content ?? "";
 }
 
+type ProviderResult = { raw: string; provider: string };
+
+async function runWithFallback(image: string): Promise<ProviderResult> {
+  const errors: string[] = [];
+  const geminiKey = process.env.GEMINI_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
+
+  if (geminiKey) {
+    for (const model of ["gemini-2.5-flash", "gemini-2.5-flash-lite"]) {
+      try {
+        const raw = await withRetry(model, () =>
+          scanWithGemini(image, geminiKey, model)
+        );
+        if (raw) return { raw, provider: model };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push(`${model}: ${msg.slice(0, 160)}`);
+      }
+    }
+  }
+
+  if (openaiKey) {
+    try {
+      const raw = await withRetry("openai-gpt-4o", () =>
+        scanWithOpenAI(image, openaiKey)
+      );
+      if (raw) return { raw, provider: "openai-gpt-4o" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`openai-gpt-4o: ${msg.slice(0, 160)}`);
+    }
+  }
+
+  throw new Error(
+    errors.length
+      ? `Wszystkie modele AI niedostępne. Spróbuj za chwilę.\nSzczegóły: ${errors.join(" | ")}`
+      : "Brak skonfigurowanego klucza AI"
+  );
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -112,9 +181,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const hasGemini = !!process.env.GEMINI_API_KEY;
-    const hasOpenAI = !!process.env.OPENAI_API_KEY;
-    if (!hasGemini && !hasOpenAI) {
+    if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) {
       return NextResponse.json(
         {
           error:
@@ -124,23 +191,14 @@ export async function POST(req: Request) {
       );
     }
 
-    const raw = hasGemini
-      ? await scanWithGemini(parsed.data.image, process.env.GEMINI_API_KEY!)
-      : await scanWithOpenAI(parsed.data.image, process.env.OPENAI_API_KEY!);
-
-    if (!raw) {
-      return NextResponse.json(
-        { error: "Model nie zwrócił żadnej odpowiedzi" },
-        { status: 502 }
-      );
-    }
+    const { raw, provider } = await runWithFallback(parsed.data.image);
 
     let json: unknown;
     try {
       json = JSON.parse(raw);
     } catch {
       return NextResponse.json(
-        { error: "Model zwrócił nieparsowalny JSON", raw },
+        { error: `Model ${provider} zwrócił nieparsowalny JSON`, raw },
         { status: 502 }
       );
     }
@@ -149,7 +207,7 @@ export async function POST(req: Request) {
     if (!result.success) {
       return NextResponse.json(
         {
-          error: "Model zwrócił niezgodny ze schematem JSON",
+          error: `Model ${provider} zwrócił niezgodny ze schematem JSON`,
           details: result.error.format(),
           raw,
         },
@@ -160,6 +218,6 @@ export async function POST(req: Request) {
     return NextResponse.json(result.data);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Nieznany błąd";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: message }, { status: 503 });
   }
 }
